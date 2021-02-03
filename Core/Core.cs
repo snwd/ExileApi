@@ -92,7 +92,6 @@ namespace ExileCore
                 FormHandle = _form.Handle;
                 _settings = new SettingsContainer();
                 _coreSettings = _settings.CoreSettings;
-                _coreSettings.Threads = new RangeNode<int>(_coreSettings.Threads.Value, 0, Environment.ProcessorCount);
                 CoroutineRunner = new Runner("Main Coroutine");
                 CoroutineRunnerParallel = new Runner("Parallel Coroutine");
 
@@ -138,28 +137,11 @@ namespace ExileCore
                 MainRunner = CoroutineRunner;
                 ParallelRunner = CoroutineRunnerParallel;
 
-                // Task.Run(ParallelCoroutineRunner);
-                var th = new Thread(ParallelCoroutineManualThread) {Name = "Parallel Coroutine", IsBackground = true};
-                th.Start();
                 _mainMenu = new MenuWindow(this, _settings, _dx11.ImGuiRender.fonts, ref versionChecker);
                 _debugWindow = new DebugWindow(Graphics, _coreSettings);
 
-                MultiThreadManager = new MultiThreadManager(_coreSettings.Threads);
+                MultiThreadManager = new MultiThreadManager();
                 CoroutineRunner.MultiThreadManager = MultiThreadManager;
-
-                _coreSettings.Threads.OnValueChanged += (sender, i) =>
-                {
-                    if (MultiThreadManager == null)
-                        MultiThreadManager = new MultiThreadManager(i);
-                    else
-                    {
-                        var coroutine1 =
-                            new Coroutine(() => { MultiThreadManager.ChangeNumberThreads(_coreSettings.Threads); },
-                                new WaitTime(2000), null, "Change Threads Number", false) {SyncModWork = true};
-
-                        ParallelRunner.Run(coroutine1);
-                    }
-                };
 
                 TargetPcFrameTime = 1000f / _coreSettings.TargetFps;
                 _targetParallelFpsTime = 1000f / _coreSettings.TargetParallelFPS;
@@ -337,6 +319,9 @@ namespace ExileCore
                 else
                     ForeGroundTime = 0;
 
+                ForeGroundTime = 0;
+
+
                 if (ForeGroundTime <= 100)
                 {
                     try
@@ -367,6 +352,9 @@ namespace ExileCore
                     return;
                 }
 
+                MultiThreadManager.AddJob(GameController.EntityListWrapper.CollectEntitiesJob());
+                MultiThreadManager.AddJob(GameController.EntityListWrapper.UpdateJob());
+
                 _timeSec += GameController.DeltaTime;
 
                 if (_timeSec >= 1000)
@@ -393,100 +381,26 @@ namespace ExileCore
 
                 if (ForeGroundTime <= 150 && pluginManager != null)
                 {
-                    WaitingJobs.Clear();
 
-                    if (_coreSettings.CollectDebugInformation)
+                    foreach (var plugin in pluginManager?.Plugins)
                     {
-                        foreach (var plugin in pluginManager?.Plugins)
-                        {
-                            if (!plugin.IsEnable) continue;
-                            if (!GameController.InGame && !plugin.Force) continue;
-                            plugin.CanRender = true;
-                            var job = plugin.PerfomanceTick();
-                            if (job == null) continue;
+                        if (!plugin.IsEnable) continue;
+                        if (!GameController.InGame && !plugin.Force) continue;
+                        plugin.CanRender = true;
+                        var job = plugin.Tick();
+                        if (job == null) continue;
+                        if (job.IsQueued) continue;
 
-                            if (MultiThreadManager.ThreadsCount > 0)
-                            {
-                                if (!job.IsStarted)
-                                    MultiThreadManager.AddJob(job);
-
-                                WaitingJobs.Add((plugin, job));
-                            }
-                            else
-                                plugin.TickDebugInformation.TickAction(job.Work);
-                        }
-                    }
-                    else
-                    {
-                        foreach (var plugin in pluginManager?.Plugins)
-                        {
-                            if (!plugin.IsEnable) continue;
-                            if (!GameController.InGame && !plugin.Force) continue;
-                            plugin.CanRender = true;
-                            var job = plugin.Tick();
-                            if (job == null) continue;
-
-                            if (MultiThreadManager.ThreadsCount > 0)
-                            {
-                                if (!job.IsStarted)
-                                    MultiThreadManager.AddJob(job);
-
-                                WaitingJobs.Add((plugin, job));
-                            }
-                            else
-                                job.Work();
-                        }
+                        MultiThreadManager.AddJob(job);
                     }
 
-                    if (WaitingJobs.Count > 0)
+                    MultiThreadManager.RunJobs();
+
+                    foreach (var plugin in pluginManager?.Plugins)
                     {
-                        MultiThreadManager.Process(this);
-                        SpinWait.SpinUntil(() => WaitingJobs.AllF(x => x.job.IsCompleted), JOB_TIMEOUT_MS);
-
-                        if (_coreSettings.CollectDebugInformation)
-                        {
-                            foreach (var waitingJob in WaitingJobs)
-                            {
-                                waitingJob.plugin.TickDebugInformation.CorrectAfterTick(
-                                    (float) waitingJob.job.ElapsedMs);
-
-                                if (waitingJob.job.IsFailed && waitingJob.job.IsCompleted)
-                                {
-                                    waitingJob.plugin.CanRender = false;
-
-                                    DebugWindow.LogMsg(
-                                        $"{waitingJob.plugin.Name} job timeout: {waitingJob.job.ElapsedMs} ms. Thread# {waitingJob.job.WorkingOnThread}");
-                                }
-                            }
-                        }
-                        else
-                        {
-                            foreach (var waitingJob in WaitingJobs)
-                            {
-                                if (waitingJob.job.IsFailed)
-                                    waitingJob.plugin.CanRender = false;
-                            }
-                        }
-                    }
-
-                    if (_coreSettings.CollectDebugInformation)
-                    {
-                        foreach (var plugin in pluginManager?.Plugins)
-                        {
-                            if (!plugin.IsEnable) continue;
-                            if (!plugin.CanRender) continue;
-                            if (!GameController.InGame && !plugin.Force) continue;
-                            plugin.PerfomanceRender();
-                        }
-                    }
-                    else
-                    {
-                        foreach (var plugin in pluginManager?.Plugins)
-                        {
-                            if (!plugin.IsEnable) continue;
-                            if (!GameController.InGame && !plugin.Force) continue;
-                            plugin.Render();
-                        }
+                        if (!plugin.IsEnable) continue;
+                        if (!GameController.InGame && !plugin.Force) continue;
+                        plugin.Render();
                     }
                 }
 
@@ -521,57 +435,16 @@ namespace ExileCore
                 .ToList();
 
             clients.AddRange(Process.GetProcessesByName(Offsets.Korean.ExeName).Select(p => (p, Offsets.Korean)));
-            var ixChosen = clients.Count > 1 ? ChooseSingleProcess(clients) : 0;
+            clients.AddRange(Process.GetProcessesByName(Offsets.Steam.ExeName).Select(p => (p, Offsets.Steam)));
+
+            var isChosen = clients.Count > 1 ? ChooseSingleProcess(clients) : 0;
 
             if (clients.Count > 0)
-                return clients[ixChosen];
+            {
+                return clients[isChosen];
+            }
 
             return null;
-        }
-
-        private void ParallelCoroutineManualThread()
-        {
-            try
-            {
-                while (true)
-                {
-                    MultiThreadManager?.Process(this);
-                    _startParallelCoroutineTimer = _sw.Elapsed.TotalMilliseconds;
-
-                    if (CoroutineRunnerParallel.IsRunning)
-                    {
-                        try
-                        {
-                            for (var i = 0; i < CoroutineRunnerParallel.IterationPerFrame; i++)
-                            {
-                                CoroutineRunnerParallel.Update();
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            DebugWindow.LogMsg($"Coroutine Parallel error: {e.Message}", 6, Color.White);
-                        }
-                    }
-                    else
-                        Thread.Sleep(10);
-
-                    _endParallelCoroutineTimer = _sw.Elapsed.TotalMilliseconds;
-                    _elTime = _endParallelCoroutineTimer - _startParallelCoroutineTimer;
-
-                    _parallelCoroutineTickDebugInformation.Tick = _elTime;
-
-                    if (_elTime < _targetParallelFpsTime)
-                    {
-                        var millisecondsDelay = _targetParallelFpsTime - _elTime;
-                        Thread.Sleep((int) millisecondsDelay);
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                DebugWindow.LogMsg($"Coroutine Parallel error: {e.Message}", 6, Color.White);
-                throw;
-            }
         }
 
         public void Render()
@@ -587,10 +460,7 @@ namespace ExileCore
 
                 if (CoroutineRunner.IsRunning)
                 {
-                    if (_coreSettings.CoroutineMultiThreading)
-                        CoroutineRunner.ParallelUpdate();
-                    else
-                        CoroutineRunner.Update();
+                    CoroutineRunner.Update();
                 }
 
                 _tickEnd = _sw.Elapsed.TotalMilliseconds;

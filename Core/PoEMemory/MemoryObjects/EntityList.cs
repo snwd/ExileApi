@@ -11,7 +11,6 @@ namespace ExileCore.PoEMemory.MemoryObjects
 {
     public class EntityList : RemoteMemoryObject
     {
-        private readonly WaitTime collectEntities = new WaitTime(1);
         private readonly List<long> hashAddresses = new List<long>(1000);
         private readonly HashSet<long> hashSet = new HashSet<long>(256);
         private readonly object locker = new object();
@@ -20,17 +19,17 @@ namespace ExileCore.PoEMemory.MemoryObjects
         private readonly Stopwatch sw = Stopwatch.StartNew();
         public int EntitiesProcessed { get; private set; }
 
-        public IEnumerator CollectEntities(EntityCollectSettingsContainer container)
+        public void CollectEntities(EntityCollectSettingsContainer container)
         {
             if (Address == 0)
             {
                 DebugWindow.LogError($"{nameof(EntityList)} -> Address is 0;");
-                yield return new WaitTime(100);
+                return;
             }
 
             while (!container.NeedUpdate)
             {
-                yield return collectEntities;
+                return;
             }
 
             sw.Restart();
@@ -85,99 +84,11 @@ namespace ExileCore.PoEMemory.MemoryObjects
                 TheGame.IngameState.UpdateData();
             }
 
-            if (container.ParseEntitiesInMultiThread() && container.CollectEntitiesInParallelWhenMoreThanX && container.MultiThreadManager != null &&
-                EntitiesProcessed / container.MultiThreadManager.ThreadsCount >= 100)
+            foreach (var addrEntity in hashAddresses)
             {
-                var hashAddressesCount = hashAddresses.Count / container.MultiThreadManager.ThreadsCount;
-                var jobs = new List<Job>(container.MultiThreadManager.ThreadsCount);
-                var lastStart = container.MultiThreadManager.ThreadsCount * hashAddressesCount;
-
-                for (var i = 1; i <= container.MultiThreadManager.ThreadsCount; i++)
-                {
-                    var i1 = i;
-
-                    var job = container.MultiThreadManager.AddJob(() =>
-                    {
-                        try
-                        {
-                            int addressesCount;
-
-                            if (i == container.MultiThreadManager.ThreadsCount)
-                                addressesCount = hashAddresses.Count;
-                            else
-                                addressesCount = i1 * hashAddressesCount;
-
-                            var start = (i1 - 1) * hashAddressesCount;
-                            Span<uint> stackIds = stackalloc uint[addressesCount - start];
-                            var index = 0;
-
-                            for (var j = start; j < addressesCount; j++)
-                            {
-                                var addrEntity = hashAddresses[j];
-
-                                stackIds[index] = ParseEntity(addrEntity, container.EntityCache, container.EntitiesVersion, container.Simple,
-                                    parseServerEntities);
-
-                                index++;
-                            }
-
-                            lock (locker)
-                            {
-                                foreach (var u in stackIds)
-                                {
-                                    StoreIds.Add(u);
-                                }
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            DebugWindow.LogError($"{e}");
-                        }
-                    }, $"EntityCollection {i}");
-
-                    jobs.Add(job);
-                }
-
-                /*try
-                {
-                    Span<uint> stackIds = stackalloc uint[hashAddresses.Count-hashAddressesCount];
-                    var index = 0;
-                    for (var j = lastStart; j < hashAddresses.Count; j++)
-                    {
-                        var addrEntity = hashAddresses[j];
-                       stackIds[index]= ParseEntity(addrEntity, entityCache, entitiesVersion, result);
-                       index++;
-
-                    }
-                    lock (locker)
-                    {
-                        foreach (var u in stackIds)
-                        {
-                            StoreIds.Add(u);
-                        }
-                    }
-                }
-                catch (Exception e)
-                {
-                    DebugWindow.LogError($"{e}");
-                }*/
-
-                while (!jobs.AllF(x => x.IsCompleted))
-                {
-                    sw.Stop();
-                    yield return collectEntities;
-                    sw.Start();
-                }
-
-                jobsTimeSum = jobs.SumF(x => x.ElapsedMs);
+                StoreIds.Add(ParseEntity(addrEntity, container.EntityCache, container.EntitiesVersion, container.Simple, parseServerEntities));
             }
-            else
-            {
-                foreach (var addrEntity in hashAddresses)
-                {
-                    StoreIds.Add(ParseEntity(addrEntity, container.EntityCache, container.EntitiesVersion, container.Simple, parseServerEntities));
-                }
-            }
+            
 
             if (container.Break)
             {

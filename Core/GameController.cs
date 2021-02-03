@@ -13,23 +13,6 @@ using SharpDX;
 
 namespace ExileCore
 {
-    public class PluginBridge
-    {
-        private readonly Dictionary<string, object> methods = new Dictionary<string, object>();
-
-        public T GetMethod<T>(string name) where T : class
-        {
-            if (methods.TryGetValue(name, out var result)) return result as T;
-
-            return null;
-        }
-
-        public void SaveMethod(string name, object method)
-        {
-            methods[name] = method;
-        }
-    }
-
     public class GameController : IDisposable
     {
         private readonly CoreSettings _settings;
@@ -38,9 +21,11 @@ namespace ExileCore
         private readonly TimeCache<Vector2> LeftCornerMap;
         private readonly TimeCache<Vector2> UnderCornerMap;
         private bool IsForeGroundLast;
-        public PluginBridge PluginBridge;
 
-        public GameController(Memory memory, SoundController soundController, SettingsContainer settings,
+        public GameController(
+            Memory memory, 
+            SoundController soundController, 
+            SettingsContainer settings,
             MultiThreadManager multiThreadManager)
         {
             _settings = settings.CoreSettings;
@@ -56,14 +41,13 @@ namespace ExileCore
                 Area = new AreaController(Game);
                 Window = new GameWindow(memory.Process);
                 Files = Game.Files;
-                EntityListWrapper = new EntityListWrapper(this, _settings, multiThreadManager);
+                EntityListWrapper = new EntityListWrapper(this, _settings);
             }
             catch (Exception e)
             {
                 DebugWindow.LogError(e.ToString());
             }
 
-            PluginBridge = new PluginBridge();
 
             IsForeGroundCache = WinApi.IsForegroundWindow(Window.Process.MainWindowHandle);
             var values = Enum.GetValues(typeof(IconPriority));
@@ -112,7 +96,6 @@ namespace ExileCore
 
             _settings.RefreshArea.OnPressed += () => { Area.ForceRefreshArea(); };
             Area.RefreshState();
-            EntityListWrapper.StartWork();
             Initialized = true;
         }
 

@@ -50,8 +50,6 @@ namespace ExileCore
         [Menu("Performance", 3000)]
         public EmptyNode EmptyPerfomance { get; set; } = new EmptyNode();
         [Menu("Threads count", 1, 3000)]
-        public RangeNode<int> Threads { get; set; } = new RangeNode<int>(1, 0, 4);
-        [Menu("HUD VSync", 2, 3000)]
         public ToggleNode VSync { get; set; } = new ToggleNode(false);
         [Menu("Dynamic FPS", "Hud FPS like FPS game", 3, 3000)]
 

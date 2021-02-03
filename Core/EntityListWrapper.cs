@@ -14,15 +14,12 @@ namespace ExileCore
         public Stack<Entity> Simple { get; set; }
         public Queue<uint> KeyForDelete { get; set; }
         public Dictionary<uint, Entity> EntityCache { get; set; }
-        public MultiThreadManager MultiThreadManager { get; set; }
         public Func<ToggleNode> ParseServer { get; set; }
         public Func<long> EntitiesCount { get; set; }
         public uint EntitiesVersion { get; set; }
         public bool NeedUpdate { get; set; } = true;
-        public ToggleNode CollectEntitiesInParallelWhenMoreThanX { get; set; }
         public DebugInformation DebugInformation { get; set; }
         public bool Break { get; set; }
-        public Func<bool> ParseEntitiesInMultiThread { get; set; }
     }
 
     public class EntityListWrapper
@@ -33,12 +30,10 @@ namespace ExileCore
         private readonly GameController gameController;
         private readonly Queue<uint> keysForDelete = new Queue<uint>(24);
 
-        private readonly Coroutine parallelUpdateDictionary;
         private readonly Stack<Entity> Simple = new Stack<Entity>(512);
-        private readonly Coroutine updateEntity;
-        private readonly EntityCollectSettingsContainer entityCollectSettingsContainer;
+        private readonly EntityCollectSettingsContainer _entityCollectSettingsContainer;
         private static EntityListWrapper _instance;
-        public EntityListWrapper(GameController gameController, CoreSettings settings, MultiThreadManager multiThreadManager)
+        public EntityListWrapper(GameController gameController, CoreSettings settings)
         {
             _instance = this;
             this.gameController = gameController;
@@ -48,38 +43,18 @@ namespace ExileCore
             gameController.Area.OnAreaChange += AreaChanged;
             EntitiesVersion = 0;
 
-            updateEntity =
-                new Coroutine(RefreshState, new WaitTime(coroutineTimeWait), null, "Update Entity")
-                    {Priority = CoroutinePriority.High, SyncModWork = true};
 
-            var collectEntitiesDebug = new DebugInformation("Collect Entities");
-
-            entityCollectSettingsContainer = new EntityCollectSettingsContainer();
-            entityCollectSettingsContainer.Simple = Simple;
-            entityCollectSettingsContainer.KeyForDelete = keysForDelete;
-            entityCollectSettingsContainer.EntityCache = entityCache;
-            entityCollectSettingsContainer.MultiThreadManager = multiThreadManager;
-            entityCollectSettingsContainer.ParseServer = () => settings.ParseServerEntities;
-            entityCollectSettingsContainer.ParseEntitiesInMultiThread = () => settings.ParseEntitiesInMultiThread;
-            entityCollectSettingsContainer.EntitiesCount = () => gameController.IngameState.Data.EntitiesCount;
-            entityCollectSettingsContainer.EntitiesVersion = EntitiesVersion;
-            entityCollectSettingsContainer.CollectEntitiesInParallelWhenMoreThanX = settings.CollectEntitiesInParallelWhenMoreThanX;
-            entityCollectSettingsContainer.DebugInformation = collectEntitiesDebug;
-
-            IEnumerator Test()
+            _entityCollectSettingsContainer = new EntityCollectSettingsContainer
             {
-                while (true)
-                {
-                    yield return gameController.IngameState.Data.EntityList.CollectEntities(entityCollectSettingsContainer);
-                    yield return new WaitTime(1000 / settings.EntitiesUpdate);
-                    parallelUpdateDictionary.UpdateTicks((uint) (parallelUpdateDictionary.Ticks + 1));
-                }
-            }
+                Simple = Simple,
+                KeyForDelete = keysForDelete,
+                EntityCache = entityCache,
+                ParseServer = () => _settings.ParseServerEntities,
+                EntitiesCount = () => gameController.IngameState.Data.EntitiesCount,
+                EntitiesVersion = EntitiesVersion,
+                DebugInformation = new DebugInformation("Collect Entities")
+            };
 
-            parallelUpdateDictionary = new Coroutine(Test(), null, "Collect entites") {SyncModWork = true};
-            UpdateCondition(1000 / settings.EntitiesUpdate);
-
-            settings.EntitiesUpdate.OnValueChanged += (sender, i) => { UpdateCondition(1000 / i); };
 
             var enumValues = typeof(EntityType).GetEnumValues();
             ValidEntitiesByType = new Dictionary<EntityType, List<Entity>>(enumValues.Length);
@@ -92,6 +67,21 @@ namespace ExileCore
             PlayerUpdate += (sender, entity) => Entity.Player = entity;
         }
 
+        public Job UpdateJob()
+        {
+            return new Job(nameof(RefreshState), RefreshState);
+        }
+
+        public Job CollectEntitiesJob()
+        {
+            return new Job(nameof(CollectEntities), CollectEntities);
+        }
+
+        private void CollectEntities()
+        {
+            gameController.IngameState.Data.EntityList.CollectEntities(_entityCollectSettingsContainer);
+        }
+
         public ICollection<Entity> Entities => entityCache.Values;
         public uint EntitiesVersion { get; }
         public Entity Player { get; private set; }
@@ -99,18 +89,6 @@ namespace ExileCore
         public List<Entity> NotOnlyValidEntities { get; } = new List<Entity>(500);
         public Dictionary<uint, Entity> NotValidDict { get; } = new Dictionary<uint, Entity>(500);
         public Dictionary<EntityType, List<Entity>> ValidEntitiesByType { get; }
-
-        public void StartWork()
-        {
-            Core.MainRunner.Run(updateEntity);
-            Core.ParallelRunner.Run(parallelUpdateDictionary);
-        }
-
-        private void UpdateCondition(int coroutineTimeWait = 50)
-        {
-            parallelUpdateDictionary.UpdateCondtion(new WaitTime(coroutineTimeWait));
-            updateEntity.UpdateCondtion(new WaitTime(coroutineTimeWait));
-        }
 
 #pragma warning disable CS0067
         public event Action<Entity> EntityAdded;
@@ -123,7 +101,7 @@ namespace ExileCore
         {
             try
             {
-                entityCollectSettingsContainer.Break = true;
+                _entityCollectSettingsContainer.Break = true;
                 var dataLocalPlayer = gameController.Game.IngameState.Data.LocalPlayer;
 
                 if (Player == null)
@@ -203,10 +181,10 @@ namespace ExileCore
             }
         }
 
-        public void RefreshState()
+        private void RefreshState()
         {
             if (gameController.Area.CurrentArea == null) return;
-            if (entityCollectSettingsContainer.NeedUpdate) return;
+            if (_entityCollectSettingsContainer.NeedUpdate) return;
             if (Player == null || !Player.IsValid) return;
 
             while (Simple.Count > 0)
@@ -235,7 +213,7 @@ namespace ExileCore
             }
 
             UpdateEntityCollections();
-            entityCollectSettingsContainer.NeedUpdate = true;
+            _entityCollectSettingsContainer.NeedUpdate = true;
         }
 
         public event EventHandler<Entity> PlayerUpdate;

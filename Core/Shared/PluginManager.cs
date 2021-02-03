@@ -281,25 +281,11 @@ namespace ExileCore.Shared
 
         private void EntityListWrapperOnEntityAdded(Entity entity)
         {
-            if (_gameController.Settings.CoreSettings.AddedMultiThread && _multiThreadManager.ThreadsCount > 0)
+            foreach (var plugin in Plugins)
             {
-                var listJob = new List<Job>();
+                if (!plugin.IsEnable) continue;
 
-                Plugins.WhereF(x => x.IsEnable).Batch(_multiThreadManager.ThreadsCount)
-                    .ForEach(wrappers =>
-                        listJob.Add(_multiThreadManager.AddJob(() => wrappers.ForEach(x => x.EntityAdded(entity)),
-                            "Entity added")));
-
-                _multiThreadManager.Process(this);
-                SpinWait.SpinUntil(() => listJob.AllF(x => x.IsCompleted), 500);
-            }
-            else
-            {
-                foreach (var plugin in Plugins)
-                {
-                    if (plugin.IsEnable)
-                        plugin.EntityAdded(entity);
-                }
+                _multiThreadManager.AddJob(() => plugin.EntityAdded(entity), $"Entity added, {plugin.Name}");
             }
         }
 
