@@ -1,9 +1,11 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using ExileCore.Shared;
 using ExileCore.Shared.Enums;
+using ExileCore.Shared.Nodes;
 using GameOffsets;
 using JM.LinqFaster;
 
@@ -11,63 +13,52 @@ namespace ExileCore.PoEMemory.MemoryObjects
 {
     public class EntityList : RemoteMemoryObject
     {
-        private readonly List<long> hashAddresses = new List<long>(1000);
-        private readonly HashSet<long> hashSet = new HashSet<long>(256);
-        private readonly object locker = new object();
-        private readonly Queue<long> queue = new Queue<long>(256);
-        private readonly HashSet<long> StoreIds = new HashSet<long>(256);
+        // the node Queue is used to loop through all nodes (Node = 1 item in EntityList -> 1 EntityListOffsets object)
+        private readonly Queue<long> _nodeAddressQueue = new Queue<long>(256);
+        // the node HashSet is used to check if a node was already processed
+        private readonly HashSet<long> _nodeAddressHashSet = new HashSet<long>(256);
+
+        // entity addresses are the result, which is used to then parse the entities
+        private readonly List<long> _entityAddresses = new List<long>(1000);
+
         private readonly Stopwatch sw = Stopwatch.StartNew();
-        public int EntitiesProcessed { get; private set; }
 
-        public void CollectEntities(EntityCollectSettingsContainer container)
+        private List<long> CollectEntityAddresses()
         {
-            if (Address == 0)
-            {
-                DebugWindow.LogError($"{nameof(EntityList)} -> Address is 0;");
-                return;
-            }
+            // The entity list is a linked list (next, prev) and the entity address itself
 
-            while (!container.NeedUpdate)
-            {
-                return;
-            }
+            var firstNodeAddress = M.Read<long>(Address + 0x8);
+            _entityAddresses.Clear();
+            _nodeAddressHashSet.Clear();
 
-            sw.Restart();
-            var dataEntitiesCount = container.EntitiesCount();
-            var parseServerEntities = container.ParseServer();
-            double jobsTimeSum = 0;
-            var addr = M.Read<long>(Address + 0x8);
-            hashAddresses.Clear();
-            hashSet.Clear();
-            StoreIds.Clear();
-            queue.Enqueue(addr);
-            var node = M.Read<EntityListOffsets>(addr);
-            queue.Enqueue(node.FirstAddr);
-            queue.Enqueue(node.SecondAddr);
-            var loopcount = 0;
+            _nodeAddressQueue.Enqueue(firstNodeAddress);
+            var node = M.Read<EntityListOffsets>(firstNodeAddress);
+            _nodeAddressQueue.Enqueue(node.FirstAddr);
+            _nodeAddressQueue.Enqueue(node.SecondAddr);
+            var safetyCounter = 0;
 
-            while (queue.Count > 0 && loopcount < 10000)
+            while (_nodeAddressQueue.Count > 0 && safetyCounter < 10000)
             {
                 try
                 {
-                    loopcount++;
-                    var nextAddr = queue.Dequeue();
+                    safetyCounter++;
+                    var nextAddr = _nodeAddressQueue.Dequeue();
 
-                    if (hashSet.Contains(nextAddr))
+                    if (_nodeAddressHashSet.Contains(nextAddr))
                         continue;
 
-                    hashSet.Add(nextAddr);
+                    _nodeAddressHashSet.Add(nextAddr);
 
-                    if (nextAddr != addr && nextAddr != 0)
+                    if (nextAddr != firstNodeAddress && nextAddr != 0)
                     {
                         var entityAddress = node.Entity;
 
                         if (entityAddress > 0x100000000 && entityAddress < 0x7F0000000000)
-                            hashAddresses.Add(entityAddress);
+                            _entityAddresses.Add(entityAddress);
 
                         node = M.Read<EntityListOffsets>(nextAddr);
-                        queue.Enqueue(node.FirstAddr);
-                        queue.Enqueue(node.SecondAddr);
+                        _nodeAddressQueue.Enqueue(node.FirstAddr);
+                        _nodeAddressQueue.Enqueue(node.SecondAddr);
                     }
                 }
                 catch (Exception e)
@@ -76,34 +67,49 @@ namespace ExileCore.PoEMemory.MemoryObjects
                 }
             }
 
-            EntitiesProcessed = hashAddresses.Count;
+            return _entityAddresses;
+        }
 
-            if (dataEntitiesCount > 0 && EntitiesProcessed / dataEntitiesCount > 1.5f)
+        public void CollectEntities(            
+            ConcurrentDictionary<uint, Entity> entityCache,
+            Queue<uint> keysToDelete,
+            Func<ToggleNode> parseServerEntities,
+            uint entitiesVersion,
+            DebugInformation debugInformation,
+            Action<Entity> entityAdded,
+            Action<Entity> entityAddedAny,
+            Action<Entity> entityRemoved
+            )
+        {
+            sw.Restart();
+            if (Address == 0)
             {
-                DebugWindow.LogError($"Something wrong we parse {EntitiesProcessed} when expect {dataEntitiesCount}");
-                TheGame.IngameState.UpdateData();
+                DebugWindow.LogError($"{nameof(EntityList)} -> Address is 0;");
+                return;
             }
 
-            foreach (var addrEntity in hashAddresses)
+            CollectEntityAddresses();
+
+            var validIds = new HashSet<long>(256);
+
+            foreach (var entityAddress in _entityAddresses)
             {
-                StoreIds.Add(ParseEntity(addrEntity, container.EntityCache, container.EntitiesVersion, container.Simple, parseServerEntities));
+                var entityId = ParseEntity(
+                    entityAddress, 
+                    entityCache, 
+                    entitiesVersion, 
+                    parseServerEntities(),
+                    entityAdded,
+                    entityAddedAny
+                    );
+                validIds.Add(entityId);
             }
             
-
-            if (container.Break)
-            {
-                container.Break = false;
-                container.EntitiesVersion++;
-                container.NeedUpdate = false;
-                container.DebugInformation.Tick = sw.Elapsed.TotalMilliseconds;
-                yield break;
-            }
-
-            foreach (var entity in container.EntityCache)
+            foreach (var entity in entityCache)
             {
                 var entityValue = entity.Value;
 
-                if (StoreIds.Contains(entity.Key))
+                if (validIds.Contains(entity.Key))
                 {
                     entityValue.IsValid = true;
                     continue;
@@ -121,48 +127,47 @@ namespace ExileCore.PoEMemory.MemoryObjects
                         {
                             if (entityValueDistancePlayer < 30)
                             {
-                                container.KeyForDelete.Enqueue(entity.Key);
+                                keysToDelete.Enqueue(entity.Key);
                                 continue;
                             }
                         }
                         else
                         {
-                            container.KeyForDelete.Enqueue(entity.Key);
+                            keysToDelete.Enqueue(entity.Key);
                             continue;
                         }
                     }
 
                     if (entityValue.Type == EntityType.Monster && entityValue.IsAlive)
                     {
-                        container.KeyForDelete.Enqueue(entity.Key);
+                        keysToDelete.Enqueue(entity.Key);
                         continue;
                     }
                 }
 
-                if (entityValueDistancePlayer > 300 &&
-                    entity.Value.Metadata.Equals("Metadata/Monsters/Totems/HeiTikiSextant", StringComparison.Ordinal))
-                {
-                    container.KeyForDelete.Enqueue(entity.Key);
-                    continue;
-                }
 
-                if ((int) entityValue.Type < 100)
+                if ((int) entityValue.Type < 100) // Error, Misc objects ...
                 {
-                    container.KeyForDelete.Enqueue(entity.Key);
+                    keysToDelete.Enqueue(entity.Key);
                     continue;
                 }
 
                 if (entityValueDistancePlayer > 1_000_000 || entity.Value.GridPos.IsZero)
-                    container.KeyForDelete.Enqueue(entity.Key);
+                    keysToDelete.Enqueue(entity.Key);
             }
 
-            container.EntitiesVersion++;
-            container.NeedUpdate = false;
-            container.DebugInformation.Tick = sw.Elapsed.TotalMilliseconds + jobsTimeSum;
+            entitiesVersion++;
+            debugInformation.Tick = sw.Elapsed.TotalMilliseconds;
         }
 
-        private uint ParseEntity(long addrEntity, Dictionary<uint, Entity> entityCache, uint entitiesVersion, Stack<Entity> result,
-            bool parseServerEntities)
+        private uint ParseEntity(
+            long addrEntity, 
+            ConcurrentDictionary<uint, Entity> entityCache, 
+            uint entitiesVersion, 
+            bool parseServerEntities,
+            Action<Entity> entityAdded,
+            Action<Entity> entityAddedAny
+            )
         {
             var entityId = M.Read<uint>(addrEntity + 0x58);
             if (entityId <= 0) return 0;
@@ -195,8 +200,15 @@ namespace ExileCore.PoEMemory.MemoryObjects
                 if (entity.Check(entityId))
                 {
                     entity.Version = entitiesVersion;
-                    result.Push(entity);
+                    entityCache.AddOrUpdate(
+                        entityId, 
+                        entity,
+                        (key, oldValue) => entity
+                    );
                     entity.IsValid = true;
+
+                    entityAdded.Invoke(entity);
+                    //entityAddedAny.Invoke(entity);
                 }
             }
 

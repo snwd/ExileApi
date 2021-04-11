@@ -285,7 +285,7 @@ namespace ExileCore.Shared
             {
                 if (!plugin.IsEnable) continue;
 
-                _multiThreadManager.AddJob(() => plugin.EntityAdded(entity), $"Entity added, {plugin.Name}");
+                plugin.EntityAdded(entity);
             }
         }
 

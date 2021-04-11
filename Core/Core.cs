@@ -159,10 +159,6 @@ namespace ExileCore
 
                 if (GameController == null && _memory != null) Inject();
 
-                var coroutine = new Coroutine(MainControl(), null, "Render control")
-                    {Priority = CoroutinePriority.Critical};
-
-                CoroutineRunnerParallel.Run(coroutine);
                 NextCoroutineTime = Time.TotalMilliseconds;
                 NextRender = Time.TotalMilliseconds;
                 if (pluginManager?.Plugins.Count == 0)
@@ -215,55 +211,52 @@ namespace ExileCore
             pluginManager?.CloseAllPlugins();
         }
 
-        private IEnumerator MainControl()
+        private void MainControl()
         {
-            while (true)
+            if (_memory == null)
             {
-                if (_memory == null)
-                {
-                    _memory = FindPoe();
-                    if (_memory == null) yield return _mainControl;
-                    continue;
-                }
-
-                if (GameController == null && _memory != null)
-                {
-                    Inject();
-                    if (GameController == null) yield return _mainControl;
-                    continue;
-                }
-
-                var clientRectangle = WinApi.GetClientRectangle(_memory.Process.MainWindowHandle);
-
-                if (lastClientBound != clientRectangle && _form.Bounds != clientRectangle &&
-                    clientRectangle.Width > 2 &&
-                    clientRectangle.Height > 2)
-                {
-                    DebugWindow.LogMsg($"Resize from: {lastClientBound} to {clientRectangle}", 5, Color.Magenta);
-                    lastClientBound = clientRectangle;
-                    _form.Invoke(new Action(() => { _form.Bounds = clientRectangle; }));
-                }
-
-                _memoryValid = !_memory.IsInvalid();
-
-                if (!_memoryValid)
-                {
-                    GameController.Dispose();
-                    GameController = null;
-                    _memory = null;
-                    _dx11.ImGuiRender.LostFocus -= LostFocus;
-                }
-                else
-                {
-                    var isForegroundWindow = WinApi.IsForegroundWindow(_memory.Process.MainWindowHandle) ||
-                                                          WinApi.IsForegroundWindow(FormHandle) || _coreSettings.ForceForeground;
-
-                    IsForeground = isForegroundWindow;
-                    GameController.IsForeGroundCache = isForegroundWindow;
-                }
-
-                yield return _mainControl2;
+                _memory = FindPoe();
+                if (_memory == null) Thread.Sleep(1000);
+                return;
             }
+
+            if (GameController == null && _memory != null)
+            {
+                Inject();
+                if (GameController == null) Thread.Sleep(1000);
+                return;
+            }
+
+            var clientRectangle = WinApi.GetClientRectangle(_memory.Process.MainWindowHandle);
+
+            if (lastClientBound != clientRectangle && _form.Bounds != clientRectangle &&
+                clientRectangle.Width > 2 &&
+                clientRectangle.Height > 2)
+            {
+                DebugWindow.LogMsg($"Resize from: {lastClientBound} to {clientRectangle}", 5, Color.Magenta);
+                lastClientBound = clientRectangle;
+                _form.Invoke(new Action(() => { _form.Bounds = clientRectangle; }));
+            }
+
+            _memoryValid = !_memory.IsInvalid();
+
+            if (!_memoryValid)
+            {
+                GameController.Dispose();
+                GameController = null;
+                _memory = null;
+                _dx11.ImGuiRender.LostFocus -= LostFocus;
+            }
+            else
+            {
+                var isForegroundWindow = WinApi.IsForegroundWindow(_memory.Process.MainWindowHandle) ||
+                                                        WinApi.IsForegroundWindow(FormHandle) || _coreSettings.ForceForeground;
+
+                IsForeground = isForegroundWindow;
+                GameController.IsForeGroundCache = isForegroundWindow;
+            }
+
+            Thread.Sleep(250);
         }
 
         public static Memory FindPoe()
@@ -310,6 +303,9 @@ namespace ExileCore
         {
             try
             {
+                MultiThreadManager.AddApiJob(new Job("MainControl", MainControl));
+                MultiThreadManager.RunJobs();
+
                 Input.Update(FormHandle);
                 _tickStartCore = _sw.Elapsed.TotalMilliseconds;
                 FramesCount++;
@@ -352,8 +348,13 @@ namespace ExileCore
                     return;
                 }
 
-                MultiThreadManager.AddJob(GameController.EntityListWrapper.CollectEntitiesJob());
-                MultiThreadManager.AddJob(GameController.EntityListWrapper.UpdateJob());
+                if (FramesCount % 50 == 0)
+                {
+                    MultiThreadManager.AddApiJob(GameController.EntityListWrapper.CollectEntitiesJob());
+                    //MultiThreadManager.AddApiJob(GameController.EntityListWrapper.UpdateJob());
+                    MultiThreadManager.RunJobs();
+                }
+
 
                 _timeSec += GameController.DeltaTime;
 
@@ -389,9 +390,8 @@ namespace ExileCore
                         plugin.CanRender = true;
                         var job = plugin.Tick();
                         if (job == null) continue;
-                        if (job.IsQueued) continue;
 
-                        MultiThreadManager.AddJob(job);
+                        MultiThreadManager.AddPluginJob(job);
                     }
 
                     MultiThreadManager.RunJobs();
@@ -453,20 +453,6 @@ namespace ExileCore
             _tickStart = _sw.Elapsed.TotalMilliseconds;
 
             ticks++;
-
-            if (NextCoroutineTime <= Time.TotalMilliseconds)
-            {
-                NextCoroutineTime += _targetParallelFpsTime;
-
-                if (CoroutineRunner.IsRunning)
-                {
-                    CoroutineRunner.Update();
-                }
-
-                _tickEnd = _sw.Elapsed.TotalMilliseconds;
-                _coroutineTickDebugInformation.Tick = (float) (_tickEnd - _tickStart);
-            }
-
 
             if (NextRender <= Time.TotalMilliseconds)
             {

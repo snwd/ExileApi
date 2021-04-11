@@ -1,6 +1,8 @@
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using ExileCore.PoEMemory.Elements;
 using ExileCore.PoEMemory.MemoryObjects;
 using ExileCore.Shared;
@@ -9,67 +11,57 @@ using ExileCore.Shared.Nodes;
 
 namespace ExileCore
 {
-    public class EntityCollectSettingsContainer
-    {
-        public Stack<Entity> Simple { get; set; }
-        public Queue<uint> KeyForDelete { get; set; }
-        public Dictionary<uint, Entity> EntityCache { get; set; }
-        public Func<ToggleNode> ParseServer { get; set; }
-        public Func<long> EntitiesCount { get; set; }
-        public uint EntitiesVersion { get; set; }
-        public bool NeedUpdate { get; set; } = true;
-        public DebugInformation DebugInformation { get; set; }
-        public bool Break { get; set; }
-    }
-
     public class EntityListWrapper
     {
         private readonly CoreSettings _settings;
-        private readonly int coroutineTimeWait = 100;
-        private readonly Dictionary<uint, Entity> entityCache;
-        private readonly GameController gameController;
-        private readonly Queue<uint> keysForDelete = new Queue<uint>(24);
+        private readonly ConcurrentDictionary<uint, Entity> _entityCache;
+        private readonly GameController _gameController;
+        private readonly Queue<uint> _keysForDelete = new Queue<uint>(24);
+        private readonly DebugInformation _debugInformation = new DebugInformation("EntitiyList");
 
-        private readonly Stack<Entity> Simple = new Stack<Entity>(512);
-        private readonly EntityCollectSettingsContainer _entityCollectSettingsContainer;
-        private static EntityListWrapper _instance;
+        public uint EntitiesVersion { get; }
+        public Entity Player { get; private set; }
+        public ICollection<Entity> Entities => _entityCache.Values;
+
+        public List<Entity> OnlyValidEntities => _entityCache
+            .Values
+            .Where(e => e.IsValid)
+            .ToList();
+
+        public List<Entity> NotOnlyValidEntities => _entityCache
+            .Values
+            .Where(e => !e.IsValid)
+            .ToList();
+
+        public List<Entity> ValidEntitiesByType(EntityType type)
+        {
+            return _entityCache
+            .Values
+            .Where(e => e.IsValid)
+            .Where(e => e.Type == type)
+            .ToList();
+        }
+
+        public event EventHandler<Entity> PlayerUpdate;
+#pragma warning disable CS0067
+        public event Action<Entity> EntityAdded;
+        public event Action<Entity> EntityAddedAny;
+        public event Action<Entity> EntityRemoved;
+        // Todo Remove deprecated "EntityIgnored"
+        public event Action<Entity> EntityIgnored;
+#pragma warning restore CS0067
+
         public EntityListWrapper(GameController gameController, CoreSettings settings)
         {
             _instance = this;
-            this.gameController = gameController;
+            _gameController = gameController;
             _settings = settings;
 
-            entityCache = new Dictionary<uint, Entity>(1000);
+            _entityCache = new ConcurrentDictionary<uint, Entity>(10, 1000);
             gameController.Area.OnAreaChange += AreaChanged;
             EntitiesVersion = 0;
 
-
-            _entityCollectSettingsContainer = new EntityCollectSettingsContainer
-            {
-                Simple = Simple,
-                KeyForDelete = keysForDelete,
-                EntityCache = entityCache,
-                ParseServer = () => _settings.ParseServerEntities,
-                EntitiesCount = () => gameController.IngameState.Data.EntitiesCount,
-                EntitiesVersion = EntitiesVersion,
-                DebugInformation = new DebugInformation("Collect Entities")
-            };
-
-
-            var enumValues = typeof(EntityType).GetEnumValues();
-            ValidEntitiesByType = new Dictionary<EntityType, List<Entity>>(enumValues.Length);
-
-            foreach (EntityType enumValue in enumValues)
-            {
-                ValidEntitiesByType[enumValue] = new List<Entity>(8);
-            }
-
             PlayerUpdate += (sender, entity) => Entity.Player = entity;
-        }
-
-        public Job UpdateJob()
-        {
-            return new Job(nameof(RefreshState), RefreshState);
         }
 
         public Job CollectEntitiesJob()
@@ -79,32 +71,27 @@ namespace ExileCore
 
         private void CollectEntities()
         {
-            gameController.IngameState.Data.EntityList.CollectEntities(_entityCollectSettingsContainer);
+            _gameController.IngameState.Data.EntityList.CollectEntities(
+                _entityCache,
+                _keysForDelete,
+                () => _settings.ParseServerEntities,
+                EntitiesVersion,
+                _debugInformation,
+                EntityAdded,
+                EntityAddedAny,
+                EntityRemoved
+                );
+            RemoveEntities();
         }
 
-        public ICollection<Entity> Entities => entityCache.Values;
-        public uint EntitiesVersion { get; }
-        public Entity Player { get; private set; }
-        public List<Entity> OnlyValidEntities { get; } = new List<Entity>(500);
-        public List<Entity> NotOnlyValidEntities { get; } = new List<Entity>(500);
-        public Dictionary<uint, Entity> NotValidDict { get; } = new Dictionary<uint, Entity>(500);
-        public Dictionary<EntityType, List<Entity>> ValidEntitiesByType { get; }
-
-#pragma warning disable CS0067
-        public event Action<Entity> EntityAdded;
-        public event Action<Entity> EntityAddedAny;
-        public event Action<Entity> EntityIgnored;
-        public event Action<Entity> EntityRemoved;
-#pragma warning restore CS0067
 
         private void AreaChanged(AreaInstance area)
         {
             try
             {
-                _entityCollectSettingsContainer.Break = true;
-                var dataLocalPlayer = gameController.Game.IngameState.Data.LocalPlayer;
+                var dataLocalPlayer = _gameController.Game.IngameState.Data.LocalPlayer;
 
-                if (Player == null)
+                if (Player == null || Player.Address != dataLocalPlayer.Address)
                 {
                     if (dataLocalPlayer.Path.StartsWith("Meta"))
                     {
@@ -113,27 +100,8 @@ namespace ExileCore
                         PlayerUpdate?.Invoke(this, Player);
                     }
                 }
-                else
-                {
-                    if (Player.Address != dataLocalPlayer.Address)
-                    {
-                        if (dataLocalPlayer.Path.StartsWith("Meta"))
-                        {
-                            Player = dataLocalPlayer;
-                            Player.IsValid = true;
-                            PlayerUpdate?.Invoke(this, Player);
-                        }
-                    }
-                }
 
-                entityCache.Clear();
-                OnlyValidEntities.Clear();
-                NotOnlyValidEntities.Clear();
-
-                foreach (var e in ValidEntitiesByType)
-                {
-                    e.Value.Clear();
-                }
+                _entityCache.Clear();
             }
             catch (Exception e)
             {
@@ -141,104 +109,50 @@ namespace ExileCore
             }
         }
 
-        private void UpdateEntityCollections()
+        private void RemoveEntities()
         {
-            OnlyValidEntities.Clear();
-            NotOnlyValidEntities.Clear();
-            NotValidDict.Clear();
-
-            foreach (var e in ValidEntitiesByType)
+            // remove entites from cache
+            while (_keysForDelete.Count > 0)
             {
-                e.Value.Clear();
-            }
+                var key = _keysForDelete.Dequeue();
 
-            while (keysForDelete.Count > 0)
-            {
-                var key = keysForDelete.Dequeue();
-
-                if (entityCache.TryGetValue(key, out var entity))
+                if (_entityCache.TryGetValue(key, out var entity))
                 {
                     EntityRemoved?.Invoke(entity);
-                    entityCache.Remove(key);
-                }
-            }
-
-            foreach (var entity in entityCache)
-            {
-                var entityValue = entity.Value;
-
-                if (entityValue.IsValid)
-                {
-                    OnlyValidEntities.Add(entityValue);
-                    ValidEntitiesByType[entityValue.Type].Add(entityValue);
-                }
-                else
-                {
-                    NotOnlyValidEntities.Add(entityValue);
-                    NotValidDict[entityValue.Id] = entityValue;
-
+                    var removed = false;
+                    while(!removed)
+                    {
+                        removed = _entityCache.TryRemove(key, out _);
+                    }
                 }
             }
         }
 
-        private void RefreshState()
-        {
-            if (gameController.Area.CurrentArea == null) return;
-            if (_entityCollectSettingsContainer.NeedUpdate) return;
-            if (Player == null || !Player.IsValid) return;
+        // ToDo: remove this hack!
 
-            while (Simple.Count > 0)
-            {
-                var entity = Simple.Pop();
-
-                if (entity == null)
-                {
-                    DebugWindow.LogError($"{nameof(EntityListWrapper)}.{nameof(RefreshState)} entity is null. (Very strange).");
-                    continue;
-                }
-
-                var entityId = entity.Id;
-                if (entityCache.TryGetValue(entityId, out _)) continue;
-
-                if (entityId >= int.MaxValue && !_settings.ParseServerEntities)
-                    continue;
-
-                if (entity.Type == EntityType.Error)
-                    continue;
-
-                EntityAddedAny?.Invoke(entity);
-                if ((int) entity.Type >= 100) EntityAdded?.Invoke(entity);
-
-                entityCache[entityId] = entity;
-            }
-
-            UpdateEntityCollections();
-            _entityCollectSettingsContainer.NeedUpdate = true;
-        }
-
-        public event EventHandler<Entity> PlayerUpdate;
+        private static EntityListWrapper _instance;
 
         public static Entity GetEntityById(uint id)
         {
-            return _instance.entityCache.TryGetValue(id, out var result) ? result : null;
+            return _instance._entityCache.TryGetValue(id, out var result) ? result : null;
         }
 
         public string GetLabelForEntity(Entity entity)
         {
             var hashSet = new HashSet<long>();
-            var entityLabelMap = gameController.Game.IngameState.EntityLabelMap;
+            var entityLabelMap = _gameController.Game.IngameState.EntityLabelMap;
             var num = entityLabelMap;
 
             while (true)
             {
                 hashSet.Add(num);
-                if (gameController.Memory.Read<long>(num + 0x10) == entity.Address) break;
+                if (_gameController.Memory.Read<long>(num + 0x10) == entity.Address) break;
 
-                num = gameController.Memory.Read<long>(num);
+                num = _gameController.Memory.Read<long>(num);
                 if (hashSet.Contains(num) || num == 0 || num == -1) return null;
             }
 
-            return gameController.Game.ReadObject<EntityLabel>(num + 0x18).Text;
+            return _gameController.Game.ReadObject<EntityLabel>(num + 0x18).Text;
         }
     }
 }
